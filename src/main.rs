@@ -135,11 +135,37 @@ struct Cfg {
     tttt_bin: String,
 }
 
-fn inject_into_tttt(cfg: &Cfg, text: &str) -> Result<(), String> {
-    // One physical input line: raw '\n' keystrokes would submit mid-text.
-    let line = text.replace(['\r', '\n'], " | ");
+/// Break up `[TAG]` runs that tttt's send_keys would turn into keystrokes
+/// ([ENTER], [CTRL+C], ...): polled output is untrusted, so a zero-width
+/// space after '[' keeps the text readable but never matches a key token.
+fn neutralize_key_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        out.push(chars[i]);
+        if chars[i] == '[' {
+            let tag: String = chars[i + 1..]
+                .iter()
+                .take_while(|c| **c != ']')
+                .collect();
+            let tagish = !tag.is_empty()
+                && tag.len() <= 12
+                && tag.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '+');
+            if tagish && chars[i + 1..].iter().any(|c| *c == ']') {
+                out.push('\u{200b}');
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn run_ctl_send(cfg: &Cfg, extra: &[&str]) -> Result<(), String> {
+    let mut args = vec!["ctl", "send", cfg.session.as_str()];
+    args.extend_from_slice(extra);
     let out = Command::new(&cfg.tttt_bin)
-        .args(["ctl", "send", &cfg.session, &line, "--enter"])
+        .args(&args)
         .output()
         .map_err(|e| format!("failed to run {} ctl send: {e}", cfg.tttt_bin))?;
     if out.status.success() {
@@ -150,6 +176,17 @@ fn inject_into_tttt(cfg: &Cfg, text: &str) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+fn inject_into_tttt(cfg: &Cfg, text: &str) -> Result<(), String> {
+    // One physical input line: raw '\n' keystrokes would submit mid-text.
+    let line = neutralize_key_tokens(&text.replace(['\r', '\n'], " | "));
+    // Text first, Enter second (older tttt `ctl send --enter` DROPPED the
+    // text; two calls work with every version), with a pause so the TUI
+    // finishes rendering the typed text before it is submitted.
+    run_ctl_send(cfg, &[&line])?;
+    std::thread::sleep(Duration::from_millis(300));
+    run_ctl_send(cfg, &["--enter"])
 }
 
 fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
