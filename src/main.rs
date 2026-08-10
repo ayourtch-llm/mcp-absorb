@@ -15,12 +15,12 @@
 //! Usage: mcp-absorb [--session pty-1] [--tttt-bin tttt] -- <subordinate-cmd> [args...]
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---- subordinate connection --------------------------------------------------
 
@@ -123,11 +123,41 @@ struct LoopSpec {
     prefix: String,
 }
 
+/// Lines held back by an inject filter, oldest first.
+struct Backlog {
+    entries: VecDeque<(u64, String)>, // (unix seconds, line)
+    dropped: u64,
+}
+
+const BACKLOG_CAP: usize = 1000;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn age_str(then: u64) -> String {
+    let d = now_secs().saturating_sub(then);
+    if d < 60 {
+        format!("{d}s ago")
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else {
+        format!("{}h{}m ago", d / 3600, (d % 3600) / 60)
+    }
+}
+
 struct LoopHandle {
     spec: LoopSpec,
     stop: Arc<AtomicBool>,
     polls: Arc<AtomicU64>,
     injects: Arc<AtomicU64>,
+    /// When Some, only lines containing one of these (lowercased)
+    /// substrings are injected; the rest go to `backlog`.
+    filter: Arc<Mutex<Option<Vec<String>>>>,
+    backlog: Arc<Mutex<Backlog>>,
 }
 
 struct Cfg {
@@ -193,6 +223,8 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
     let stop = Arc::clone(&h.stop);
     let polls = Arc::clone(&h.polls);
     let injects = Arc::clone(&h.injects);
+    let filter = Arc::clone(&h.filter);
+    let backlog = Arc::clone(&h.backlog);
     let tool = h.spec.tool.clone();
     let args = h.spec.args.clone();
     let interval = Duration::from_secs_f64(h.spec.interval_secs);
@@ -211,10 +243,50 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
                     let (text, is_err) = result_text(&r);
                     let t = text.trim();
                     if !is_err && !t.is_empty() && t != ignore {
-                        // One poll's output = one batched inject, with provenance.
-                        let msg = format!("{prefix}{t}");
-                        if inject_into_tttt(&cfg, &msg).is_ok() {
-                            injects.fetch_add(1, Ordering::Relaxed);
+                        let pats = filter.lock().unwrap().clone();
+                        let to_inject: Option<String> = match pats {
+                            None => Some(t.to_string()),
+                            Some(pats) => {
+                                // Per line: matching lines interrupt, the
+                                // rest wait in the backlog.
+                                let mut pass: Vec<&str> = Vec::new();
+                                let mut held: Vec<String> = Vec::new();
+                                for line in t.lines() {
+                                    let l = line.trim();
+                                    if l.is_empty() {
+                                        continue;
+                                    }
+                                    let low = l.to_lowercase();
+                                    if pats.iter().any(|p| low.contains(p)) {
+                                        pass.push(l);
+                                    } else {
+                                        held.push(l.to_string());
+                                    }
+                                }
+                                if !held.is_empty() {
+                                    let mut b = backlog.lock().unwrap();
+                                    let ts = now_secs();
+                                    for l in held {
+                                        if b.entries.len() >= BACKLOG_CAP {
+                                            b.entries.pop_front();
+                                            b.dropped += 1;
+                                        }
+                                        b.entries.push_back((ts, l));
+                                    }
+                                }
+                                if pass.is_empty() {
+                                    None
+                                } else {
+                                    Some(pass.join("\n"))
+                                }
+                            }
+                        };
+                        if let Some(body) = to_inject {
+                            // One poll's output = one batched inject, with provenance.
+                            let msg = format!("{prefix}{body}");
+                            if inject_into_tttt(&cfg, &msg).is_ok() {
+                                injects.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
                 }
@@ -265,8 +337,33 @@ fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
         }),
         json!({
             "name": "list_tttt_inject_loops",
-            "description": "List active inject loops with their poll/inject counters.",
+            "description": "List active inject loops with their poll/inject counters, filter state and backlog depth.",
             "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "set_inject_filter",
+            "description": "Less-interrupts mode for one inject loop. With 'patterns' (case-insensitive substrings): only polled lines containing at least one pattern are injected (interrupt the session); all other lines are held in a backlog readable via fetch_inject_backlog. Without 'patterns' (or with an empty list): filter OFF, every fresh line injects again (the default). Typical IRC patterns: [\"mynick:\", \"@mynick\", \"@all\", \"<operator-nick>\"].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Loop name"},
+                    "patterns": {"type": "array", "items": {"type": "string"}, "description": "Substrings that make a line inject; omit or empty to turn the filter off"}
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "fetch_inject_backlog",
+            "description": "Read lines held back by an inject loop's filter, oldest first, each with its age. Drains what it returns unless peek=true. Returns '(backlog empty)' when there is nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Loop name"},
+                    "max_lines": {"type": "integer", "description": "At most this many lines (default: all)"},
+                    "peek": {"type": "boolean", "description": "Read without draining (default false)"}
+                },
+                "required": ["name"]
+            }
         }),
     ]
 }
@@ -290,6 +387,8 @@ fn tool_create_loop(loops: &Loops, sub: &Arc<Sub>, cfg: &Arc<Cfg>, a: &Value) ->
         stop: Arc::new(AtomicBool::new(false)),
         polls: Arc::new(AtomicU64::new(0)),
         injects: Arc::new(AtomicU64::new(0)),
+        filter: Arc::new(Mutex::new(None)),
+        backlog: Arc::new(Mutex::new(Backlog { entries: VecDeque::new(), dropped: 0 })),
     };
     run_loop(name.clone(), &handle, Arc::clone(sub), Arc::clone(cfg));
     map.insert(name.clone(), handle);
@@ -318,18 +417,99 @@ fn tool_list_loops(loops: &Loops) -> Result<String, String> {
     let mut lines: Vec<String> = map
         .iter()
         .map(|(name, h)| {
+            let filt = match h.filter.lock().unwrap().as_ref() {
+                Some(p) => format!("filter ON [{}]", p.join(", ")),
+                None => "filter off".to_string(),
+            };
+            let b = h.backlog.lock().unwrap();
             format!(
-                "{name}: poll {} {} every {}s — {} poll(s), {} inject(s)",
+                "{name}: poll {} {} every {}s — {} poll(s), {} inject(s), {}, backlog {}{}",
                 h.spec.tool,
                 h.spec.args,
                 h.spec.interval_secs,
                 h.polls.load(Ordering::Relaxed),
                 h.injects.load(Ordering::Relaxed),
+                filt,
+                b.entries.len(),
+                if b.dropped > 0 { format!(" (+{} dropped)", b.dropped) } else { String::new() },
             )
         })
         .collect();
     lines.sort();
     Ok(lines.join("\n"))
+}
+
+fn tool_set_filter(loops: &Loops, a: &Value) -> Result<String, String> {
+    let name = a["name"].as_str().ok_or("missing 'name'")?;
+    let map = loops.lock().unwrap();
+    let h = map.get(name).ok_or_else(|| format!("no loop named '{name}'"))?;
+    let pats: Vec<String> = a["patterns"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if pats.is_empty() {
+        *h.filter.lock().unwrap() = None;
+        let held = h.backlog.lock().unwrap().entries.len();
+        Ok(format!(
+            "loop '{name}': filter OFF — every fresh line injects again{}",
+            if held > 0 {
+                format!(" ({held} line(s) still in backlog; fetch_inject_backlog to read them)")
+            } else {
+                String::new()
+            }
+        ))
+    } else {
+        *h.filter.lock().unwrap() = Some(pats.clone());
+        Ok(format!(
+            "loop '{name}': filter ON — only lines containing [{}] inject; the rest go to the backlog",
+            pats.join(", ")
+        ))
+    }
+}
+
+fn tool_fetch_backlog(loops: &Loops, a: &Value) -> Result<String, String> {
+    let name = a["name"].as_str().ok_or("missing 'name'")?;
+    let max = a["max_lines"].as_u64().map(|n| n as usize);
+    let peek = a["peek"].as_bool().unwrap_or(false);
+    let map = loops.lock().unwrap();
+    let h = map.get(name).ok_or_else(|| format!("no loop named '{name}'"))?;
+    let mut b = h.backlog.lock().unwrap();
+    if b.entries.is_empty() && b.dropped == 0 {
+        return Ok("(backlog empty)".into());
+    }
+    let take = max.unwrap_or(b.entries.len()).min(b.entries.len());
+    let mut out: Vec<String> = Vec::with_capacity(take + 1);
+    if b.dropped > 0 {
+        out.push(format!(
+            "(!) {} oldest line(s) were dropped past the {}-line cap",
+            b.dropped, BACKLOG_CAP
+        ));
+    }
+    if peek {
+        for (ts, l) in b.entries.iter().take(take) {
+            out.push(format!("({}) {}", age_str(*ts), l));
+        }
+    } else {
+        for _ in 0..take {
+            if let Some((ts, l)) = b.entries.pop_front() {
+                out.push(format!("({}) {}", age_str(ts), l));
+            }
+        }
+        b.dropped = 0;
+    }
+    let left = b.entries.len();
+    if peek {
+        out.push(format!("(peek — {left} line(s) remain buffered)"));
+    } else if left > 0 {
+        out.push(format!("({left} more line(s) still buffered)"));
+    }
+    Ok(out.join("\n"))
 }
 
 // ---- main --------------------------------------------------------------------
@@ -424,6 +604,8 @@ fn main() {
                     "create_tttt_inject_loop" => Some(tool_create_loop(&loops, &sub, &cfg, &args)),
                     "delete_tttt_inject_loop" => Some(tool_delete_loop(&loops, &args)),
                     "list_tttt_inject_loops" => Some(tool_list_loops(&loops)),
+                    "set_inject_filter" => Some(tool_set_filter(&loops, &args)),
+                    "fetch_inject_backlog" => Some(tool_fetch_backlog(&loops, &args)),
                     _ => None,
                 };
                 match own {
