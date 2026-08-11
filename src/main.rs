@@ -121,6 +121,7 @@ struct LoopSpec {
     interval_secs: f64,
     ignore: String,
     prefix: String,
+    poll_timeout_secs: Option<f64>,
 }
 
 /// Lines held back by an inject filter, oldest first.
@@ -228,21 +229,36 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
     let tool = h.spec.tool.clone();
     let args = h.spec.args.clone();
     let interval = Duration::from_secs_f64(h.spec.interval_secs);
+    // A hung subordinate holds each poll for the whole call timeout, so the
+    // timeout bounds transport-failure detection latency. Loops polling cheap
+    // tools should pass poll_timeout_secs (~wait_secs + margin); the default
+    // stays generous for long-poll or slow tools.
+    let call_timeout = h
+        .spec
+        .poll_timeout_secs
+        .map(Duration::from_secs_f64)
+        .unwrap_or(interval + Duration::from_secs(630));
     let ignore = h.spec.ignore.clone();
     let prefix = h.spec.prefix.clone();
     std::thread::spawn(move || {
+        let mut err_streak: u64 = 0;
+        let mut alerted_at: Option<u64> = None;
+        let mut last_ok: u64 = now_secs();
         while !stop.load(Ordering::Relaxed) {
             polls.fetch_add(1, Ordering::Relaxed);
             let resp = sub.call(
                 "tools/call",
                 json!({"name": tool, "arguments": args}),
-                interval + Duration::from_secs(630),
+                call_timeout,
             );
+            let mut poll_err: Option<String> = None;
             match resp {
                 Ok(r) => {
                     let (text, is_err) = result_text(&r);
                     let t = text.trim();
-                    if !is_err && !t.is_empty() && t != ignore {
+                    if is_err {
+                        poll_err = Some(t.chars().take(160).collect());
+                    } else if !t.is_empty() && t != ignore {
                         let pats = filter.lock().unwrap().clone();
                         let to_inject: Option<String> = match pats {
                             None => Some(t.to_string()),
@@ -290,7 +306,45 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
                         }
                     }
                 }
-                Err(_) => { /* subordinate busy or gone; try again next tick */ }
+                Err(e) => {
+                    poll_err = Some(e.chars().take(160).collect());
+                }
+            }
+            // A persistently failing poll must not be indistinguishable from
+            // "no news": alarm after ~3 min without a good poll, re-alarm
+            // every 10 min, notice on recovery. Wall-clock,
+            // not poll-count: a HUNG subordinate burns interval+630s per
+            // attempt, so counting errors would stretch "3 min" into hours.
+            // Alarms bypass the inject filter on purpose.
+            const ERR_ALERT_SECS: u64 = 180;
+            const ERR_REALERT_SECS: u64 = 600;
+            match poll_err {
+                Some(e) => {
+                    err_streak += 1;
+                    let failing = now_secs().saturating_sub(last_ok);
+                    let due = alerted_at
+                        .map_or(true, |t| now_secs().saturating_sub(t) >= ERR_REALERT_SECS);
+                    if failing >= ERR_ALERT_SECS && due {
+                        let msg = format!(
+                            "{prefix}LOOP-ALARM: '{tool}' failing for {:.0} min ({err_streak} consecutive errors; last: {e}). Incoming messages may be silently missed.",
+                            failing as f64 / 60.0
+                        );
+                        if inject_into_tttt(&cfg, &msg).is_ok() {
+                            alerted_at = Some(now_secs());
+                        }
+                    }
+                }
+                None => {
+                    if alerted_at.is_some() {
+                        let msg = format!(
+                            "{prefix}LOOP-RECOVERED: '{tool}' polling ok again after {err_streak} consecutive errors."
+                        );
+                        let _ = inject_into_tttt(&cfg, &msg);
+                    }
+                    err_streak = 0;
+                    alerted_at = None;
+                    last_ok = now_secs();
+                }
             }
             // Sleep in short slices so delete_tttt_inject_loop takes effect fast.
             let mut left = interval;
@@ -321,7 +375,8 @@ fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
                     "args": {"type": "object", "description": "Arguments for the polled tool, e.g. {\"wait_secs\": 5}"},
                     "interval_secs": {"type": "number", "description": "Pause between polls (default 10, clamped 1-600)"},
                     "ignore": {"type": "string", "description": "Result text meaning 'no news', skipped (default: \"(no new messages)\")"},
-                    "prefix": {"type": "string", "description": "Provenance prefix for injected text (default: \"[<name>] \")"}
+                    "prefix": {"type": "string", "description": "Provenance prefix for injected text (default: \"[<name>] \")"},
+                    "poll_timeout_secs": {"type": "number", "description": "Per-poll call timeout (clamped 5-3600; default interval+630). Set to the polled tool's wait_secs + ~30s so a dead/hung subordinate is detected in minutes, not the long-poll default."}
                 },
                 "required": ["name", "tool"]
             }
@@ -377,13 +432,14 @@ fn tool_create_loop(loops: &Loops, sub: &Arc<Sub>, cfg: &Arc<Cfg>, a: &Value) ->
     let interval_secs = a["interval_secs"].as_f64().unwrap_or(10.0).clamp(1.0, 600.0);
     let ignore = a["ignore"].as_str().unwrap_or("(no new messages)").to_string();
     let prefix = a["prefix"].as_str().map(|s| s.to_string()).unwrap_or_else(|| format!("[{name}] "));
+    let poll_timeout_secs = a["poll_timeout_secs"].as_f64().map(|v| v.clamp(5.0, 3600.0));
 
     let mut map = loops.lock().unwrap();
     if map.contains_key(&name) {
         return Err(format!("loop '{name}' already exists"));
     }
     let handle = LoopHandle {
-        spec: LoopSpec { tool: tool.clone(), args, interval_secs, ignore, prefix },
+        spec: LoopSpec { tool: tool.clone(), args, interval_secs, ignore, prefix, poll_timeout_secs },
         stop: Arc::new(AtomicBool::new(false)),
         polls: Arc::new(AtomicU64::new(0)),
         injects: Arc::new(AtomicU64::new(0)),
