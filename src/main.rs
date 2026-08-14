@@ -159,6 +159,68 @@ struct LoopHandle {
     /// substrings are injected; the rest go to `backlog`.
     filter: Arc<Mutex<Option<Vec<String>>>>,
     backlog: Arc<Mutex<Backlog>>,
+    /// Per-sender (last-line unix ts, was-it-injected) — drives the
+    /// continuation-marker inherit and the follow window.
+    follow: Arc<Mutex<HashMap<String, (u64, bool)>>>,
+    /// (c) follow-window seconds: after an injected line from a sender,
+    /// further lines from the same sender within this window also inject
+    /// (ayourtch 2026-08-14: tagged-once means interested in the burst).
+    /// 0 disables the window; the "…" continuation inherit (b) stays on.
+    follow_window: Arc<AtomicU64>,
+}
+
+/// Extract "<nick>" sender and the message body from a provenance-prefixed
+/// line like "[#claude] <claude-helper> text". None for lines without one
+/// (webex/email formats) — those get plain pattern filtering only.
+fn line_sender_and_body(line: &str) -> Option<(String, &str)> {
+    let lt = line.find('<')?;
+    let gt = line[lt..].find('>')? + lt;
+    let sender = line[lt + 1..gt].trim();
+    if sender.is_empty() || sender.contains(' ') {
+        return None;
+    }
+    let sender = sender.to_lowercase();
+    Some((sender, line[gt + 1..].trim_start()))
+}
+
+/// Continuation fragments from the irc client's auto-split start with this
+/// (see mcp-irc-client CONTINUATION_MARKER; agreed household-wide 2026-08-14).
+const CONT_MARKER: char = '\u{2026}';
+/// A "…" fragment inherits the previous line's decision within this cap.
+const CONT_INHERIT_SECS: u64 = 600;
+
+/// One line's inject decision under an active filter. Updates `follow`.
+fn filter_decide(
+    l: &str,
+    pats: &[String],
+    follow: &mut HashMap<String, (u64, bool)>,
+    window: u64,
+    now: u64,
+) -> bool {
+    let low = l.to_lowercase();
+    let mut inject = pats.iter().any(|p| low.contains(p));
+    if let Some((sender, body)) = line_sender_and_body(l) {
+        let prev = follow.get(&sender).copied();
+        if !inject {
+            if body.starts_with(CONT_MARKER) {
+                // (b) continuation inherits the previous line's decision
+                if let Some((ts, was)) = prev {
+                    if was && now.saturating_sub(ts) <= CONT_INHERIT_SECS {
+                        inject = true;
+                    }
+                }
+            } else if window > 0 {
+                // (c) follow window after an injected line from this sender
+                if let Some((ts, was)) = prev {
+                    if was && now.saturating_sub(ts) <= window {
+                        inject = true;
+                    }
+                }
+            }
+        }
+        follow.insert(sender, (now, inject));
+    }
+    inject
 }
 
 struct Cfg {
@@ -226,6 +288,8 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
     let injects = Arc::clone(&h.injects);
     let filter = Arc::clone(&h.filter);
     let backlog = Arc::clone(&h.backlog);
+    let follow = Arc::clone(&h.follow);
+    let follow_window = Arc::clone(&h.follow_window);
     let tool = h.spec.tool.clone();
     let args = h.spec.args.clone();
     let interval = Duration::from_secs_f64(h.spec.interval_secs);
@@ -267,18 +331,21 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
                                 // rest wait in the backlog.
                                 let mut pass: Vec<&str> = Vec::new();
                                 let mut held: Vec<String> = Vec::new();
+                                let now = now_secs();
+                                let win = follow_window.load(Ordering::Relaxed);
+                                let mut fmap = follow.lock().unwrap();
                                 for line in t.lines() {
                                     let l = line.trim();
                                     if l.is_empty() {
                                         continue;
                                     }
-                                    let low = l.to_lowercase();
-                                    if pats.iter().any(|p| low.contains(p)) {
+                                    if filter_decide(l, &pats, &mut fmap, win, now) {
                                         pass.push(l);
                                     } else {
                                         held.push(l.to_string());
                                     }
                                 }
+                                drop(fmap);
                                 if !held.is_empty() {
                                     let mut b = backlog.lock().unwrap();
                                     let ts = now_secs();
@@ -402,7 +469,8 @@ fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Loop name"},
-                    "patterns": {"type": "array", "items": {"type": "string"}, "description": "Substrings that make a line inject; omit or empty to turn the filter off"}
+                    "patterns": {"type": "array", "items": {"type": "string"}, "description": "Substrings that make a line inject; omit or empty to turn the filter off"},
+                    "follow_window_secs": {"type": "integer", "description": "After an injected line from a sender, further lines from the same sender within this many seconds also inject (default 60, max 3600, 0 = off). \"…\" continuation fragments always inherit the previous line's decision."}
                 },
                 "required": ["name"]
             }
@@ -444,6 +512,8 @@ fn tool_create_loop(loops: &Loops, sub: &Arc<Sub>, cfg: &Arc<Cfg>, a: &Value) ->
         polls: Arc::new(AtomicU64::new(0)),
         injects: Arc::new(AtomicU64::new(0)),
         filter: Arc::new(Mutex::new(None)),
+        follow: Arc::new(Mutex::new(HashMap::new())),
+        follow_window: Arc::new(AtomicU64::new(60)),
         backlog: Arc::new(Mutex::new(Backlog { entries: VecDeque::new(), dropped: 0 })),
     };
     run_loop(name.clone(), &handle, Arc::clone(sub), Arc::clone(cfg));
@@ -474,7 +544,11 @@ fn tool_list_loops(loops: &Loops) -> Result<String, String> {
         .iter()
         .map(|(name, h)| {
             let filt = match h.filter.lock().unwrap().as_ref() {
-                Some(p) => format!("filter ON [{}]", p.join(", ")),
+                Some(p) => format!(
+                    "filter ON [{}] follow {}s",
+                    p.join(", "),
+                    h.follow_window.load(Ordering::Relaxed)
+                ),
                 None => "filter off".to_string(),
             };
             let b = h.backlog.lock().unwrap();
@@ -509,6 +583,11 @@ fn tool_set_filter(loops: &Loops, a: &Value) -> Result<String, String> {
                 .collect()
         })
         .unwrap_or_default();
+    if let Some(w) = a["follow_window_secs"].as_u64() {
+        h.follow_window.store(w.min(3600), Ordering::Relaxed);
+    }
+    h.follow.lock().unwrap().clear();
+    let win = h.follow_window.load(Ordering::Relaxed);
     if pats.is_empty() {
         *h.filter.lock().unwrap() = None;
         let held = h.backlog.lock().unwrap().entries.len();
@@ -523,7 +602,7 @@ fn tool_set_filter(loops: &Loops, a: &Value) -> Result<String, String> {
     } else {
         *h.filter.lock().unwrap() = Some(pats.clone());
         Ok(format!(
-            "loop '{name}': filter ON — only lines containing [{}] inject; the rest go to the backlog",
+            "loop '{name}': filter ON — lines containing [{}] inject; \"…\" continuation fragments inherit the previous line's decision; other lines from a sender within {win}s of an injected one follow it in; the rest go to the backlog",
             pats.join(", ")
         ))
     }
@@ -704,4 +783,63 @@ fn main() {
         }
     }
     let _ = child.kill();
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::{filter_decide, line_sender_and_body};
+    use std::collections::HashMap;
+
+    fn pats() -> Vec<String> {
+        vec!["claude-mini".into(), "@all".into(), "<ayourtch>".into()]
+    }
+
+    #[test]
+    fn sender_extraction() {
+        assert_eq!(
+            line_sender_and_body("[#claude] <claude-helper> hello there"),
+            Some(("claude-helper".into(), "hello there"))
+        );
+        assert_eq!(line_sender_and_body("[webex] plain text no nick"), None);
+    }
+
+    #[test]
+    fn continuation_inherits_inject() {
+        let mut f = HashMap::new();
+        assert!(filter_decide("[#claude] <helper> claude-mini: part one", &pats(), &mut f, 0, 100));
+        assert!(filter_decide("[#claude] <helper> … the tail", &pats(), &mut f, 0, 102));
+    }
+
+    #[test]
+    fn continuation_inherits_hold() {
+        let mut f = HashMap::new();
+        assert!(!filter_decide("[#claude] <helper> otherbot: not for us", &pats(), &mut f, 0, 100));
+        assert!(!filter_decide("[#claude] <helper> … its tail stays held", &pats(), &mut f, 0, 102));
+    }
+
+    #[test]
+    fn follow_window_pulls_in_burst_and_expires() {
+        let mut f = HashMap::new();
+        assert!(filter_decide("[#claude] <helper> claude-mini: tagged", &pats(), &mut f, 60, 100));
+        assert!(filter_decide("[#claude] <helper> follow-up thought", &pats(), &mut f, 60, 130));
+        assert!(filter_decide("[#claude] <helper> chained follow-up", &pats(), &mut f, 60, 185));
+        assert!(!filter_decide("[#claude] <helper> an hour later", &pats(), &mut f, 60, 4000));
+    }
+
+    #[test]
+    fn window_zero_disables_follow_not_marker() {
+        let mut f = HashMap::new();
+        assert!(filter_decide("[#claude] <helper> claude-mini: tagged", &pats(), &mut f, 0, 100));
+        assert!(!filter_decide("[#claude] <helper> unmarked follow-up", &pats(), &mut f, 0, 101));
+        // held line resets inheritance for the next marker fragment
+        assert!(!filter_decide("[#claude] <helper> … tail of the HELD line stays held", &pats(), &mut f, 0, 102));
+    }
+
+    #[test]
+    fn senders_do_not_cross_contaminate() {
+        let mut f = HashMap::new();
+        assert!(filter_decide("[#claude] <helper> claude-mini: tagged", &pats(), &mut f, 60, 100));
+        assert!(!filter_decide("[#claude] <otherbot> unrelated line", &pats(), &mut f, 60, 101));
+        assert!(!filter_decide("[#claude] <otherbot> … and its tail", &pats(), &mut f, 60, 102));
+    }
 }
