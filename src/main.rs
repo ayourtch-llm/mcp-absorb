@@ -237,6 +237,25 @@ fn neutralize_key_tokens(text: &str) -> String {
     let mut i = 0;
     while i < chars.len() {
         out.push(chars[i]);
+        // Token-leading '@' (start of text or after whitespace/bracketing
+        // punctuation) triggers the Claude Code TUI's @-mention file
+        // autocomplete when the injected text is typed: the token can be
+        // fuzzy-matched to a LOCAL file and auto-read into the session's
+        // context — including '@' arriving from data nobody typed, e.g. the
+        // IRC op sigil in a NAMES reply. Break the trigger with a zero-width
+        // space, same mechanism as the [TAG] neutralization below. Mid-word
+        // '@' (email addresses) is left alone so no invisible character can
+        // ride along into a copied address.
+        if chars[i] == '@'
+            && (i == 0
+                || chars[i - 1].is_whitespace()
+                || matches!(chars[i - 1], '(' | '[' | '{' | '"' | '\'' | ':' | ';' | ',' | '<' | '|'))
+            && i + 1 < chars.len()
+            && !chars[i + 1].is_whitespace()
+            && chars[i + 1] != '@'
+        {
+            out.push('\u{200b}');
+        }
         if chars[i] == '[' {
             let tag: String = chars[i + 1..]
                 .iter()
@@ -841,5 +860,36 @@ mod filter_tests {
         assert!(filter_decide("[#claude] <helper> claude-mini: tagged", &pats(), &mut f, 60, 100));
         assert!(!filter_decide("[#claude] <otherbot> unrelated line", &pats(), &mut f, 60, 101));
         assert!(!filter_decide("[#claude] <otherbot> … and its tail", &pats(), &mut f, 60, 102));
+    }
+}
+
+#[cfg(test)]
+mod neutralize_tests {
+    use super::neutralize_key_tokens;
+
+    #[test]
+    fn at_token_start_gets_zwsp() {
+        assert_eq!(neutralize_key_tokens("@claudine is op"), "@\u{200b}claudine is op");
+        assert_eq!(neutralize_key_tokens("hi @all folks"), "hi @\u{200b}all folks");
+        assert_eq!(neutralize_key_tokens("(@claudine)"), "(@\u{200b}claudine)");
+        assert_eq!(neutralize_key_tokens("users: @claudine"), "users: @\u{200b}claudine");
+    }
+
+    #[test]
+    fn email_addresses_untouched() {
+        assert_eq!(neutralize_key_tokens("Eimolough@yahoo.com"), "Eimolough@yahoo.com");
+        assert_eq!(neutralize_key_tokens("mail from a@b.c today"), "mail from a@b.c today");
+    }
+
+    #[test]
+    fn bare_or_trailing_at_untouched() {
+        assert_eq!(neutralize_key_tokens("an @ alone"), "an @ alone");
+        assert_eq!(neutralize_key_tokens("ends with @"), "ends with @");
+        assert_eq!(neutralize_key_tokens("@@weird"), "@@weird");
+    }
+
+    #[test]
+    fn tag_neutralization_still_works() {
+        assert_eq!(neutralize_key_tokens("[TAG] body"), "[\u{200b}TAG] body");
     }
 }
