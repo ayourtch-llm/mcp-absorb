@@ -336,49 +336,61 @@ struct Cfg {
     tttt_bin: String,
 }
 
-/// Break up `[TAG]` runs that tttt's send_keys would turn into keystrokes
-/// ([ENTER], [CTRL+C], ...): polled output is untrusted, so a zero-width
-/// space after '[' keeps the text readable but never matches a key token.
+/// Make untrusted text (chat lines) inert for tttt's send_keys while it
+/// still SHOWS verbatim in the session. send_keys turns `[TAG]`, `^X`,
+/// `\n`/`\r`/`\t` and `\xHH` into keystrokes (tttt
+/// crates/tttt-pty/src/keys.rs `process_special_keys`), so a chat line
+/// saying "^C" or "\r" would interrupt or submit. Its `\xHH` form is
+/// the one literal escape it has: `\`, `^` and `[` are sent as `\x5c`,
+/// `\x5e`, `\x5b` and arrive as themselves. Real control characters
+/// and invisible format characters are shown as visible `\xHH` /
+/// `\u{...}` text: sending them would be a keystroke, and an invisible
+/// character makes the Claude Code TUI hold the input unsubmitted ("Removed
+/// 1 invisible character", the 2026-10-01 overnight stall). The old
+/// zero-width-space escapes did exactly that, so none are used here.
 fn neutralize_key_tokens(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+    let mut out = String::with_capacity(text.len() + 8);
     let chars: Vec<char> = text.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        out.push(chars[i]);
-        // Token-leading '@' (start of text or after whitespace/bracketing
-        // punctuation) triggers the Claude Code TUI's @-mention file
-        // autocomplete when the injected text is typed: the token can be
-        // fuzzy-matched to a LOCAL file and auto-read into the session's
-        // context — including '@' arriving from data nobody typed, e.g. the
-        // IRC op sigil in a NAMES reply. Break the trigger with a zero-width
-        // space, same mechanism as the [TAG] neutralization below. Mid-word
-        // '@' (email addresses) is left alone so no invisible character can
-        // ride along into a copied address.
-        if chars[i] == '@'
-            && (i == 0
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '\\' => out.push_str("\\x5c"),
+            '^' => out.push_str("\\x5e"),
+            '[' => out.push_str("\\x5b"),
+            // Token-leading '@' (start of text or after whitespace/bracketing
+            // punctuation) triggers the Claude Code TUI's @-mention file
+            // autocomplete when the text is typed: the token can be
+            // fuzzy-matched to a LOCAL file and auto-read into the session's
+            // context. A FULLWIDTH '＠' (U+FF20) reads the same, triggers no
+            // autocomplete and submits normally (tested 2026-10-01). Mid-word
+            // '@' (email addresses) is left alone.
+            '@' if (i == 0
                 || chars[i - 1].is_whitespace()
                 || matches!(chars[i - 1], '(' | '[' | '{' | '"' | '\'' | ':' | ';' | ',' | '<' | '|'))
-            && i + 1 < chars.len()
-            && !chars[i + 1].is_whitespace()
-            && chars[i + 1] != '@'
-        {
-            out.push('\u{200b}');
-        }
-        if chars[i] == '[' {
-            let tag: String = chars[i + 1..]
-                .iter()
-                .take_while(|c| **c != ']')
-                .collect();
-            let tagish = !tag.is_empty()
-                && tag.len() <= 12
-                && tag.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '+');
-            if tagish && chars[i + 1..].iter().any(|c| *c == ']') {
-                out.push('\u{200b}');
+                && i + 1 < chars.len()
+                && !chars[i + 1].is_whitespace()
+                && chars[i + 1] != '@' =>
+            {
+                out.push('\u{ff20}')
             }
+            c if (c as u32) < 0x100 && c.is_control() => {
+                // C0, DEL and C1: visible text, never the key itself.
+                out.push_str(&format!("\\x5cx{:02x}", c as u32));
+            }
+            c if is_invisible_format(c) => {
+                out.push_str(&format!("\\x5cu{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
         }
-        i += 1;
     }
     out
+}
+
+/// Zero-width and bidi-control characters (Unicode Cf that renders as
+/// nothing); the TUI strips them and then holds the input for review.
+fn is_invisible_format(c: char) -> bool {
+    matches!(c as u32,
+        0x00ad | 0x061c | 0x180e | 0x200b..=0x200f | 0x202a..=0x202e
+        | 0x2060..=0x2064 | 0x2066..=0x206f | 0xfeff | 0xfff9..=0xfffb)
 }
 
 fn run_ctl_send(cfg: &Cfg, extra: &[&str]) -> Result<(), String> {
@@ -1190,31 +1202,109 @@ mod debounce_tests {
 
 #[cfg(test)]
 mod neutralize_tests {
-    use super::neutralize_key_tokens;
+    use super::neutralize_key_tokens as n;
 
-    #[test]
-    fn at_token_start_gets_zwsp() {
-        assert_eq!(neutralize_key_tokens("@claudine is op"), "@\u{200b}claudine is op");
-        assert_eq!(neutralize_key_tokens("hi @all folks"), "hi @\u{200b}all folks");
-        assert_eq!(neutralize_key_tokens("(@claudine)"), "(@\u{200b}claudine)");
-        assert_eq!(neutralize_key_tokens("users: @claudine"), "users: @\u{200b}claudine");
+    /// A SUPERSET of tttt's send_keys decoder (tttt
+    /// crates/tttt-pty/src/keys.rs `process_special_keys`): every
+    /// `[UPPER+DIGITS]` run counts as a key (tttt only knows a list), every
+    /// `^letter`, and `\n` `\r` `\t` `\xHH` as there. Text that survives
+    /// this decoder unchanged survives tttt's. If tttt grows NEW syntax
+    /// (not a new [TAG] name), update this mirror and the escaper.
+    fn decode(input: &str) -> Vec<u8> {
+        let b = input.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        while i < b.len() {
+            if b[i] == b'^' && i + 1 < b.len() && b[i + 1].is_ascii_alphabetic() {
+                out.push(0x01); // a control key fired
+                i += 2;
+                continue;
+            }
+            if b[i] == b'\\' && i + 1 < b.len() {
+                match b[i + 1] {
+                    b'n' | b'r' | b't' => {
+                        out.push(0x01);
+                        i += 2;
+                        continue;
+                    }
+                    b'x' if i + 3 < b.len()
+                        && b[i + 2].is_ascii_hexdigit()
+                        && b[i + 3].is_ascii_hexdigit() =>
+                    {
+                        out.push(u8::from_str_radix(&input[i + 2..i + 4], 16).unwrap());
+                        i += 4;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            if b[i] == b'[' {
+                if let Some(end) = input[i..].find(']') {
+                    let tag = &input[i + 1..i + end];
+                    if !tag.is_empty() && tag.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'+') {
+                        out.push(0x01);
+                        i += end + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        out
+    }
+    fn shown(text: &str) -> String {
+        String::from_utf8(decode(&n(text))).unwrap()
     }
 
     #[test]
-    fn email_addresses_untouched() {
-        assert_eq!(neutralize_key_tokens("Eimolough@yahoo.com"), "Eimolough@yahoo.com");
-        assert_eq!(neutralize_key_tokens("mail from a@b.c today"), "mail from a@b.c today");
+    fn key_syntax_arrives_verbatim() {
+        for t in ["^C ^c ^M ^D", r"\r \n \t \x1b \x03", "[ENTER] [CTRL+C] [F1] [ESC]",
+                  r"C:\new\tmp ^Z", r"\x5c already escaped", "a[b]c ^ \\ [", "x^2 + y^2"] {
+            assert_eq!(shown(t), t, "{t:?}");
+        }
     }
 
     #[test]
-    fn bare_or_trailing_at_untouched() {
-        assert_eq!(neutralize_key_tokens("an @ alone"), "an @ alone");
-        assert_eq!(neutralize_key_tokens("ends with @"), "ends with @");
-        assert_eq!(neutralize_key_tokens("@@weird"), "@@weird");
+    fn all_printable_ascii_arrives_verbatim() {
+        // every printable byte, alone and in pairs ('@' excluded: it is rewritten on purpose)
+        let p: Vec<char> = (0x20u8..0x7f).map(|b| b as char).filter(|c| *c != '@').collect();
+        for &a in &p {
+            for &b in &p {
+                let t = format!("x{a}{b}AB]C");
+                assert_eq!(shown(&t), t);
+            }
+        }
     }
 
     #[test]
-    fn tag_neutralization_still_works() {
-        assert_eq!(neutralize_key_tokens("[TAG] body"), "[\u{200b}TAG] body");
+    fn control_and_invisible_chars_become_visible_text() {
+        assert_eq!(shown("a\u{1b}b\u{3}c\u{7f}d\u{85}"), r"a\x1bb\x03c\x7fd\x85");
+        assert_eq!(shown("a\u{200b}b\u{feff}c\u{202e}"), r"a\u{200b}b\u{feff}c\u{202e}");
+    }
+
+    #[test]
+    fn nothing_decodes_to_a_key_or_invisible_char() {
+        let all: String = (0u32..0x3000).filter_map(char::from_u32).collect();
+        let out = shown(&all);
+        assert!(out.bytes().all(|b| b >= 0x20 && b != 0x7f), "a key byte survived");
+        assert!(!out.chars().any(|c| ('\u{80}'..='\u{9f}').contains(&c) || super::is_invisible_format(c)));
+    }
+
+    #[test]
+    fn token_leading_at_becomes_fullwidth() {
+        assert_eq!(n("@claudine is op"), "\u{ff20}claudine is op");
+        assert_eq!(n("hi @all folks"), "hi \u{ff20}all folks");
+        assert_eq!(n("(@claudine)"), "(\u{ff20}claudine)");
+        assert_eq!(n("users: @claudine"), "users: \u{ff20}claudine");
+        assert_eq!(shown("[@x]"), "[\u{ff20}x]");
+    }
+
+    #[test]
+    fn email_and_bare_at_untouched() {
+        assert_eq!(n("Eimolough@yahoo.com"), "Eimolough@yahoo.com");
+        assert_eq!(n("mail from a@b.c today"), "mail from a@b.c today");
+        assert_eq!(n("an @ alone"), "an @ alone");
+        assert_eq!(n("ends with @"), "ends with @");
+        assert_eq!(n("@@weird"), "@@weird");
     }
 }
