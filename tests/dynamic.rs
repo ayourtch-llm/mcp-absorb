@@ -119,7 +119,9 @@ impl Drop for Absorb {
 }
 
 #[test]
-fn dynamic_mode_exposes_only_the_five_dynamic_tools() {
+fn dynamic_mode_exposes_the_five_dyn_plus_five_inject_loop_tools() {
+    // v2a updated this v1 assertion: dynamic mode now ALSO exposes the 5
+    // inject-loop tools (loops poll a (server, tool) pair).
     let mut a = Absorb::start(Some(&fx_allowlist("fx")));
     a.rpc("initialize", json!({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
     let mut names: Vec<String> = a.rpc("tools/list", json!({}))["result"]["tools"]
@@ -129,7 +131,21 @@ fn dynamic_mode_exposes_only_the_five_dynamic_tools() {
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
     names.sort();
-    assert_eq!(names, vec!["attach", "call", "detach", "list", "tools"]);
+    assert_eq!(
+        names,
+        vec![
+            "attach",
+            "call",
+            "create_tttt_inject_loop",
+            "delete_tttt_inject_loop",
+            "detach",
+            "fetch_inject_backlog",
+            "list",
+            "list_tttt_inject_loops",
+            "set_inject_filter",
+            "tools",
+        ]
+    );
 }
 
 #[test]
@@ -208,7 +224,7 @@ fn missing_allowlist_starts_fine_and_attach_quotes_the_reason() {
     let mut a = Absorb::start(None); // allowlist path points at a nonexistent file
     a.rpc("initialize", json!({"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}));
     // server started and answers normally:
-    assert_eq!(a.rpc("tools/list", json!({}))["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(a.rpc("tools/list", json!({}))["result"]["tools"].as_array().unwrap().len(), 10); // 5 dyn + 5 loop (v2a)
     let (text, is_err) = a.tool("attach", json!({"name": "anything"}));
     assert!(is_err && text.contains("cannot read allowlist"), "{text}");
     let (text, is_err) = a.tool("list", json!({}));

@@ -432,7 +432,72 @@ fn inject_into_tttt(cfg: &Cfg, text: &str) -> Result<(), String> {
     run_ctl_send(cfg, &["--enter"])
 }
 
-fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
+// ---- v2a: loop poll targets (SPEC-dynamic v2a) --------------------------------
+
+/// Where one loop tick's `tools/call` goes: the single static subordinate
+/// (today's behavior, exactly), or an attached server resolved from the Dyn
+/// map at EVERY poll (dynamic mode). `gen` stamps the attach generation the
+/// loop was created against: a server missing from the map (detached) or an
+/// entry with a NEWER generation (detached, maybe re-attached — re-attach
+/// revives NOTHING) ENDS the loop; recreating it is one explicit tool call.
+enum SubRef {
+    Static(Arc<Sub>),
+    Dynamic(Arc<Dyn>, String, u64),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TickAction {
+    Poll,
+    EndLoop,
+}
+
+/// Pure per-tick target decision: Poll while the server is in the map with the
+/// same generation the loop was created against; a missing entry or a newer
+/// generation ENDS the loop (the loop then injects one final note). A call-level
+/// failure on a previous poll (timeout, write error) NEVER ends the loop:
+/// failures keep the static skip/backlog/alarm semantics — only the missing
+/// generation does. Hence `last_call_failed` is (deliberately) unused here.
+fn resolve_tick(entry_gen: Option<u64>, create_gen: u64, last_call_failed: bool) -> TickAction {
+    let _ = last_call_failed;
+    match entry_gen {
+        Some(g) if g == create_gen => TickAction::Poll,
+        _ => TickAction::EndLoop,
+    }
+}
+
+enum Resolved {
+    Poll(Arc<Sub>),
+    Ends { server: String },
+}
+
+fn resolve_target(r: &SubRef, last_call_failed: bool) -> Resolved {
+    match r {
+        SubRef::Static(s) => Resolved::Poll(Arc::clone(s)),
+        SubRef::Dynamic(dynst, server, gen) => {
+            let entry = dynst
+                .map
+                .lock()
+                .unwrap()
+                .get(server)
+                .map(|e| (e.gen, Arc::clone(&e.sub)));
+            match resolve_tick(entry.as_ref().map(|(g, _)| *g), *gen, last_call_failed) {
+                TickAction::Poll => Resolved::Poll(entry.map(|(_, s)| s).unwrap()),
+                TickAction::EndLoop => Resolved::Ends {
+                    server: server.clone(),
+                },
+            }
+        }
+    }
+}
+
+fn run_loop(
+    name: String,
+    h: &LoopHandle,
+    target: SubRef,
+    loops: Arc<Loops>,
+    servers: Arc<LoopServers>,
+    cfg: Arc<Cfg>,
+) {
     let stop = Arc::clone(&h.stop);
     let polls = Arc::clone(&h.polls);
     let injects = Arc::clone(&h.injects);
@@ -460,6 +525,22 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
         let mut alerted_at: Option<u64> = None;
         let mut last_ok: u64 = now_secs();
         while !stop.load(Ordering::Relaxed) {
+            // v2a: resolve the poll target fresh every tick. Static: the same
+            // Arc<Sub> as ever. Dynamic: server missing from the map (detach,
+            // or a re-attach carrying a newer generation) ENDS the loop after
+            // ONE final note inject — recreate to resume.
+            let sub = match resolve_target(&target, err_streak > 0) {
+                Resolved::Poll(s) => s,
+                Resolved::Ends { server } => {
+                    let note = format!(
+                        "loop {name}: server {server} not attached, ending — recreate to resume"
+                    );
+                    let _ = inject_into_tttt(&cfg, &note);
+                    loops.lock().unwrap().remove(&name);
+                    servers.lock().unwrap().remove(&name);
+                    return;
+                }
+            };
             polls.fetch_add(1, Ordering::Relaxed);
             let resp = sub.call(
                 "tools/call",
@@ -598,8 +679,36 @@ fn run_loop(name: String, h: &LoopHandle, sub: Arc<Sub>, cfg: Arc<Cfg>) {
 
 // ---- absorb's own tools ------------------------------------------------------
 
+/// The 5 inject-loop tool schemas. With `dynamic=false` this reproduces
+/// today's schema output byte-for-byte (static-mode parity gate); with
+/// `dynamic=true` create gains its required `server` param (SPEC v2a).
 fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
-    vec![
+    loop_tools_json(cfg, false)
+}
+
+fn loop_tools_json(cfg: &Cfg, dynamic: bool) -> Vec<Value> {
+    let create = if dynamic {
+        json!({
+            "name": "create_tttt_inject_loop",
+            "description": format!(
+                "Create a background loop that polls one tool ON AN ATTACHED SERVER — the (server, tool) pair — and injects fresh output into the tttt session '{}' input (via tttt ctl). The server must be attached at create time; the loop ENDS when that server detaches (one final note, then recreate to resume). Use SHORT waits in the polled tool's args (e.g. wait_secs 0-5): the server may serve requests serially, so a long poll delays your own calls. One poll's output = one batched inject, prefixed for provenance.",
+                cfg.session),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Loop name (unique; used for list/delete)"},
+                    "server": {"type": "string", "description": "Attached server whose tool is polled (attach it first; the loop ends when the server detaches — recreate to resume)"},
+                    "tool": {"type": "string", "description": "Tool on that server to poll, e.g. irc_recv"},
+                    "args": {"type": "object", "description": "Arguments for the polled tool, e.g. {\"wait_secs\": 5}"},
+                    "interval_secs": {"type": "number", "description": "Pause between polls (default 10, clamped 1-600)"},
+                    "ignore": {"type": "string", "description": "Result text meaning 'no news', skipped (default: \"(no new messages)\")"},
+                    "prefix": {"type": "string", "description": "Provenance prefix for injected text (default: \"[<name>] \")"},
+                    "poll_timeout_secs": {"type": "number", "description": "Per-poll call timeout (clamped 5-3600; default interval+630). Set to the polled tool's wait_secs + ~30s so a dead/hung subordinate is detected in minutes, not the long-poll default."}
+                },
+                "required": ["name", "server", "tool"]
+            }
+        })
+    } else {
         json!({
             "name": "create_tttt_inject_loop",
             "description": format!(
@@ -618,7 +727,10 @@ fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
                 },
                 "required": ["name", "tool"]
             }
-        }),
+        })
+    };
+    vec![
+        create,
         json!({
             "name": "delete_tttt_inject_loop",
             "description": "Stop and remove an inject loop by name.",
@@ -664,6 +776,12 @@ fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
 }
 
 type Loops = Mutex<HashMap<String, LoopHandle>>;
+
+/// Dynamic-mode bookkeeping: loop name -> the attached server it polls, so
+/// `list_tttt_inject_loops` can show `server` + `tool` per loop. Kept out of
+/// LoopSpec/LoopHandle so the static path (and the tests that build those
+/// structs literally) stays untouched.
+type LoopServers = Mutex<HashMap<String, String>>;
 
 // ---- dynamic mode: attach/detach allowlisted MCP subordinates at runtime ------
 
@@ -759,12 +877,17 @@ struct DynEntry {
     tools: Vec<Value>,
     attached_at: u64,
     healthy: bool,
+    /// Attach generation (v2a): loops stamp the generation they were created
+    /// against; a newer generation in the map = detached (maybe re-attached)
+    /// = the loop ends. Re-attach revives nothing.
+    gen: u64,
 }
 
 struct Dyn {
     map: Mutex<HashMap<String, DynEntry>>,
     allowlist: Vec<AllowEntry>,
     allowlist_error: Option<String>,
+    next_gen: AtomicU64,
 }
 
 const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -812,9 +935,10 @@ fn dyn_attach(dynst: &Dyn, a: &Value) -> Result<String, String> {
         .iter()
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
+    let gen = dynst.next_gen.fetch_add(1, Ordering::Relaxed);
     map.insert(
         name.to_string(),
-        DynEntry { sub, child, tools, attached_at: now_secs(), healthy: true },
+        DynEntry { sub, child, tools, attached_at: now_secs(), healthy: true, gen },
     );
     Ok(format!(
         "attached '{name}': {} tool(s): {}",
@@ -829,6 +953,18 @@ fn dyn_detach(dynst: &Dyn, a: &Value) -> Result<String, String> {
         Some(mut e) => {
             let _ = e.child.kill();
             let _ = e.child.wait();
+            // v2a: fail any in-flight call promptly (a call-level error: it
+            // does NOT end loops by itself) so a loop polling this server
+            // reaches its next resolution tick soon and ENDS there with its
+            // final note — detach ends loops the same way a missing entry does.
+            let waiters: Vec<mpsc::Sender<Value>> =
+                e.sub.pending.lock().unwrap().drain().map(|(_, tx)| tx).collect();
+            for tx in waiters {
+                let _ = tx.send(json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": format!("server '{name}' detached")}
+                }));
+            }
             Ok(format!("detached '{name}'"))
         }
         None => Err(format!("'{name}' is not attached")),
@@ -960,21 +1096,82 @@ fn dyn_tools_json() -> Vec<Value> {
     ]
 }
 
-fn tool_create_loop(loops: &Loops, sub: &Arc<Sub>, cfg: &Arc<Cfg>, a: &Value) -> Result<String, String> {
+/// v2a: dynamic mode's full tool set = the 5 dyn tools + the 5 inject-loop
+/// tools (create gains the required `server` param; the loop tools poll an
+/// attached server instead of a fixed subordinate).
+fn dyn_all_tools_json(cfg: &Cfg) -> Vec<Value> {
+    let mut tools = dyn_tools_json();
+    tools.extend(loop_tools_json(cfg, true));
+    tools
+}
+
+/// Validate the create call's `server` param against the mode (SPEC v2a):
+/// required in dynamic mode (loops poll a (server, tool) pair), a clear
+/// reject in static mode (loops poll the one command-line subordinate).
+fn loop_server_arg(a: &Value, dynamic: bool) -> Result<Option<String>, String> {
+    let server = match a.get("server") {
+        Some(v) if !v.is_null() => Some(
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("server must be a non-empty string (the attached server's name)")?
+                .to_string(),
+        ),
+        _ => None,
+    };
+    match (dynamic, &server) {
+        (true, None) => Err("missing 'server': dynamic-mode loops poll a (server, tool) pair; 'server' must name a server attached at create time".to_string()),
+        (false, Some(_)) => Err("'server' is not accepted in static mode: loops poll the single subordinate fixed on the command line; drop the 'server' param (the 'server' param belongs to --dynamic mode)".to_string()),
+        _ => Ok(server),
+    }
+}
+
+fn tool_create_loop(
+    loops: &Arc<Loops>,
+    dynst: Option<&Arc<Dyn>>,
+    static_sub: Option<&Arc<Sub>>,
+    servers: &Arc<LoopServers>,
+    cfg: &Arc<Cfg>,
+    a: &Value,
+) -> Result<String, String> {
     let name = a["name"].as_str().ok_or("missing 'name'")?.to_string();
     let tool = a["tool"].as_str().ok_or("missing 'tool'")?.to_string();
+    let server = loop_server_arg(a, dynst.is_some())?;
     let args = if a["args"].is_object() { a["args"].clone() } else { json!({}) };
     let interval_secs = a["interval_secs"].as_f64().unwrap_or(10.0).clamp(1.0, 600.0);
     let ignore = a["ignore"].as_str().unwrap_or("(no new messages)").to_string();
     let prefix = a["prefix"].as_str().map(|s| s.to_string()).unwrap_or_else(|| format!("[{name}] "));
     let poll_timeout_secs = a["poll_timeout_secs"].as_f64().map(|v| v.clamp(5.0, 3600.0));
 
+    // v2a: dynamic loops poll a (server, tool) pair and stamp the attach
+    // generation (detach => the loop ends); static keeps the one fixed sub.
+    let (target, poll_disp) = match (dynst, server.clone()) {
+        (Some(d), Some(srv)) => {
+            let gen = d
+                .map
+                .lock()
+                .unwrap()
+                .get(&srv)
+                .map(|e| e.gen)
+                .ok_or_else(|| format!(
+                    "cannot create loop '{name}': server '{srv}' is not attached; attach it first (dynamic loops poll an attached server and END when it detaches — recreate to resume)"
+                ))?;
+            (SubRef::Dynamic(Arc::clone(d), srv.clone(), gen), format!("{srv}.{tool}"))
+        }
+        (None, None) => (
+            SubRef::Static(Arc::clone(static_sub.ok_or("internal error: no subordinate in static mode")?)),
+            tool.clone(),
+        ),
+        (Some(_), None) | (None, Some(_)) => {
+            unreachable!("loop_server_arg already paired server with dynamic mode")
+        }
+    };
+
     let mut map = loops.lock().unwrap();
     if map.contains_key(&name) {
         return Err(format!("loop '{name}' already exists"));
     }
     let handle = LoopHandle {
-        spec: LoopSpec { tool: tool.clone(), args, interval_secs, ignore, prefix, poll_timeout_secs },
+        spec: LoopSpec { tool, args, interval_secs, ignore, prefix, poll_timeout_secs },
         stop: Arc::new(AtomicBool::new(false)),
         polls: Arc::new(AtomicU64::new(0)),
         injects: Arc::new(AtomicU64::new(0)),
@@ -984,10 +1181,21 @@ fn tool_create_loop(loops: &Loops, sub: &Arc<Sub>, cfg: &Arc<Cfg>, a: &Value) ->
         debounce: Arc::new(Mutex::new(Debounce::default())),
         backlog: Arc::new(Mutex::new(Backlog { entries: VecDeque::new(), dropped: 0 })),
     };
-    run_loop(name.clone(), &handle, Arc::clone(sub), Arc::clone(cfg));
+    run_loop(
+        name.clone(),
+        &handle,
+        target,
+        Arc::clone(loops),
+        Arc::clone(servers),
+        Arc::clone(cfg),
+    );
     map.insert(name.clone(), handle);
+    drop(map);
+    if let Some(srv) = server {
+        servers.lock().unwrap().insert(name.clone(), srv);
+    }
     Ok(format!(
-        "loop '{name}' created: polling {tool} every {interval_secs}s, injecting fresh output into session {}",
+        "loop '{name}' created: polling {poll_disp} every {interval_secs}s, injecting fresh output into session {}",
         cfg.session
     ))
 }
@@ -1003,7 +1211,34 @@ fn tool_delete_loop(loops: &Loops, a: &Value) -> Result<String, String> {
     }
 }
 
+/// v2a (dynamic): same loop-keyed delete, plus the server side-map cleanup.
+fn tool_delete_loop_dyn(loops: &Loops, servers: &LoopServers, a: &Value) -> Result<String, String> {
+    let msg = tool_delete_loop(loops, a)?;
+    if let Some(n) = a["name"].as_str() {
+        servers.lock().unwrap().remove(n);
+    }
+    Ok(msg)
+}
+
 fn tool_list_loops(loops: &Loops) -> Result<String, String> {
+    list_loops_with(loops, &|_name, h| h.spec.tool.clone())
+}
+
+/// v2a: the dynamic view shows `server.tool` per loop (the poll target's
+/// server + tool); delete / set_inject_filter / fetch_inject_backlog stay
+/// loop-keyed and unchanged.
+fn tool_list_loops_dyn(loops: &Loops, servers: &LoopServers) -> Result<String, String> {
+    let srv = servers.lock().unwrap();
+    list_loops_with(loops, &|name, h| match srv.get(name) {
+        Some(s) => format!("{s}.{}", h.spec.tool),
+        None => h.spec.tool.clone(),
+    })
+}
+
+fn list_loops_with(
+    loops: &Loops,
+    target_of: &dyn Fn(&str, &LoopHandle) -> String,
+) -> Result<String, String> {
     let map = loops.lock().unwrap();
     if map.is_empty() {
         return Ok("(no inject loops)".into());
@@ -1023,7 +1258,7 @@ fn tool_list_loops(loops: &Loops) -> Result<String, String> {
             let b = h.backlog.lock().unwrap();
             format!(
                 "{name}: poll {} {} every {}s — {} poll(s), {} inject(s), {}, edit_debounce_secs {edit_debounce_secs}, backlog {}{}",
-                h.spec.tool,
+                target_of(name, h),
                 h.spec.args,
                 h.spec.interval_secs,
                 h.polls.load(Ordering::Relaxed),
@@ -1183,9 +1418,14 @@ fn main() {
     let cfg = Arc::new(cfg);
     // Dynamic mode: no config-fixed subordinate; servers attach/detach at
     // runtime from the allowlist. Static mode stays byte-identical.
-    let dynst: Option<Dyn> = if cfg.dynamic {
+    let dynst: Option<Arc<Dyn>> = if cfg.dynamic {
         let (allowlist, allowlist_error) = load_allowlist(&cfg.allowlist);
-        Some(Dyn { map: Mutex::new(HashMap::new()), allowlist, allowlist_error })
+        Some(Arc::new(Dyn {
+            map: Mutex::new(HashMap::new()),
+            allowlist,
+            allowlist_error,
+            next_gen: AtomicU64::new(1),
+        }))
     } else {
         None
     };
@@ -1200,7 +1440,8 @@ fn main() {
             }
         }
     };
-    let loops: Loops = Mutex::new(HashMap::new());
+    let loops: Arc<Loops> = Arc::new(Mutex::new(HashMap::new()));
+    let servers: Arc<LoopServers> = Arc::new(Mutex::new(HashMap::new()));
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -1240,11 +1481,12 @@ fn main() {
             }
             "ping" => Some(reply(json!({}))),
             "tools/list" => {
-                // Dynamic mode exposes ONLY the five dynamic tools (the
-                // inject-loop tools poll one fixed subordinate: meaningless
-                // without one, removed per SPEC-dynamic v1).
+                // v2a: dynamic mode exposes the five dynamic tools PLUS the
+                // five inject-loop tools (loops poll an attached (server,
+                // tool) pair). Static mode: subordinate tools + our five,
+                // byte-identical to before.
                 let tools: Vec<Value> = if cfg.dynamic {
-                    dyn_tools_json()
+                    dyn_all_tools_json(&cfg)
                 } else {
                     let mut tools: Vec<Value> = sub
                         .as_ref()
@@ -1269,6 +1511,12 @@ fn main() {
                         "list" => dyn_list(dynst),
                         "tools" => dyn_tools(dynst, &args),
                         "call" => dyn_call(dynst, &args),
+                        // v2a: the inject-loop tools, polling (server, tool).
+                        "create_tttt_inject_loop" => tool_create_loop(&loops, Some(dynst), None, &servers, &cfg, &args),
+                        "delete_tttt_inject_loop" => tool_delete_loop_dyn(&loops, &servers, &args),
+                        "list_tttt_inject_loops" => tool_list_loops_dyn(&loops, &servers),
+                        "set_inject_filter" => tool_set_filter(&loops, &args),
+                        "fetch_inject_backlog" => tool_fetch_backlog(&loops, &args),
                         other => Err(format!("unknown tool: {other}")),
                     };
                     let (text, is_err) = match out {
@@ -1281,7 +1529,7 @@ fn main() {
                     })))
                 } else {
                     let own = match name {
-                        "create_tttt_inject_loop" => Some(tool_create_loop(&loops, sub.as_ref().unwrap(), &cfg, &args)),
+                        "create_tttt_inject_loop" => Some(tool_create_loop(&loops, None, Some(sub.as_ref().unwrap()), &servers, &cfg, &args)),
                         "delete_tttt_inject_loop" => Some(tool_delete_loop(&loops, &args)),
                         "list_tttt_inject_loops" => Some(tool_list_loops(&loops)),
                         "set_inject_filter" => Some(tool_set_filter(&loops, &args)),
@@ -1725,5 +1973,178 @@ mod dyn_tests {
         assert_eq!(build_argv(&e), vec!["/bin/x".to_string(), "a".to_string(), "--flag".to_string()]);
         let bare = AllowEntry { name: "y".into(), command: "y".into(), args: vec![], env: HashMap::new() };
         assert_eq!(build_argv(&bare), vec!["y".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod v2a_loop_tests {
+    use super::{
+        loop_server_arg, resolve_target, resolve_tick, Resolved, Sub, SubRef, TickAction, Dyn,
+        DynEntry, LoopSpec, LoopHandle, now_secs,
+    };
+    use serde_json::json;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
+
+    // ---- loop-spec parse: server required in dynamic, rejected in static ----
+
+    #[test]
+    fn server_param_required_in_dynamic_and_rejected_in_static() {
+        // static without server: fine (today's call shape)
+        assert_eq!(
+            loop_server_arg(&json!({"name": "l", "tool": "irc_recv"}), false).unwrap(),
+            None
+        );
+        // static WITH server: clear reject (spec: static output/behavior unchanged)
+        let e = loop_server_arg(&json!({"name": "l", "tool": "t", "server": "fx"}), false)
+            .unwrap_err();
+        assert!(e.contains("'server' is not accepted in static mode"), "{e}");
+        // dynamic without server: required
+        let e = loop_server_arg(&json!({"name": "l", "tool": "irc_recv"}), true).unwrap_err();
+        assert!(e.contains("missing 'server'"), "{e}");
+        // dynamic with server: accepted
+        assert_eq!(
+            loop_server_arg(&json!({"name": "l", "tool": "t", "server": "fx"}), true).unwrap(),
+            Some("fx".to_string())
+        );
+    }
+
+    #[test]
+    fn server_param_must_be_a_nonempty_string() {
+        assert!(loop_server_arg(&json!({"server": 3}), true).is_err());
+        assert!(loop_server_arg(&json!({"server": ""}), true).is_err());
+        assert!(loop_server_arg(&json!({"server": null}), false).unwrap().is_none());
+    }
+
+    // ---- resolver transitions: ok / missing-ends / call-failure-does-not-end ----
+
+    #[test]
+    fn resolve_tick_table() {
+        // ok: attached, same generation, no pending failure -> poll
+        assert_eq!(resolve_tick(Some(1), 1, false), TickAction::Poll);
+        // call-failure does NOT end: a failed previous call never changes Poll
+        assert_eq!(resolve_tick(Some(1), 1, true), TickAction::Poll);
+        // missing from the map -> ends
+        assert_eq!(resolve_tick(None, 1, false), TickAction::EndLoop);
+        assert_eq!(resolve_tick(None, 1, true), TickAction::EndLoop);
+        // detached then re-attached (newer generation) -> ends: revive nothing
+        assert_eq!(resolve_tick(Some(2), 1, false), TickAction::EndLoop);
+    }
+
+    fn dummy_dyn(entries: &[(&str, u64)]) -> Arc<Dyn> {
+        let mut map = HashMap::new();
+        for (name, gen) in entries {
+            let (sub, child) = Sub::spawn(&["/bin/cat".to_string()]).unwrap();
+            map.insert(
+                name.to_string(),
+                DynEntry {
+                    sub,
+                    child,
+                    tools: vec![],
+                    attached_at: now_secs(),
+                    healthy: true,
+                    gen: *gen,
+                },
+            );
+        }
+        Arc::new(Dyn {
+            map: Mutex::new(map),
+            allowlist: vec![],
+            allowlist_error: None,
+            next_gen: AtomicU64::new(100),
+        })
+    }
+
+    fn cleanup(dynst: &Dyn) {
+        for (_, mut e) in dynst.map.lock().unwrap().drain() {
+            let _ = e.child.kill();
+            let _ = e.child.wait();
+        }
+    }
+
+    #[test]
+    fn target_ok_resolves_to_the_attached_sub() {
+        let dynst = dummy_dyn(&[("fx", 1)]);
+        let target = SubRef::Dynamic(Arc::clone(&dynst), "fx".into(), 1);
+        match resolve_target(&target, false) {
+            Resolved::Poll(_) => {}
+            Resolved::Ends { server } => panic!("attached server resolved to Ends: {server}"),
+        }
+        cleanup(&dynst);
+    }
+
+    #[test]
+    fn target_missing_ends_and_reattach_revives_nothing() {
+        // detach (entry removed) -> ends
+        let dynst = dummy_dyn(&[("fx", 1)]);
+        let target = SubRef::Dynamic(Arc::clone(&dynst), "fx".into(), 1);
+        cleanup(&dynst); // drains the map: the server is gone
+        match resolve_target(&target, false) {
+            Resolved::Ends { server } => assert_eq!(server, "fx"),
+            Resolved::Poll(_) => panic!("missing server resolved to Poll"),
+        }
+        // re-attach under a NEWER generation -> still ends (explicit recreate only)
+        let dynst2 = dummy_dyn(&[("fx", 2)]);
+        let target2 = SubRef::Dynamic(Arc::clone(&dynst2), "fx".into(), 1);
+        match resolve_target(&target2, false) {
+            Resolved::Ends { server } => assert_eq!(server, "fx"),
+            Resolved::Poll(_) => panic!("re-attached server revived the loop"),
+        }
+        cleanup(&dynst2);
+    }
+
+    #[test]
+    fn target_call_failure_does_not_end_the_loop() {
+        // a timeout/write-error streak (last_call_failed=true) on an attached
+        // same-generation server keeps polling (static failure semantics)
+        let dynst = dummy_dyn(&[("fx", 7)]);
+        let target = SubRef::Dynamic(Arc::clone(&dynst), "fx".into(), 7);
+        match resolve_target(&target, true) {
+            Resolved::Poll(_) => {}
+            Resolved::Ends { server } => panic!("call failure ended the loop: {server}"),
+        }
+        cleanup(&dynst);
+    }
+
+    #[test]
+    fn static_target_always_polls() {
+        let (sub, mut child) = Sub::spawn(&["/bin/cat".to_string()]).unwrap();
+        let target = SubRef::Static(sub);
+        for failed in [false, true] {
+            match resolve_target(&target, failed) {
+                Resolved::Poll(_) => {}
+                Resolved::Ends { server } => panic!("static target ended: {server}"),
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // LoopSpec keeps its static field set (v2a carries the server in the
+    // SubRef/side-map, not the spec): a compile-anchored literal doubles as
+    // the guard that the static spec did not grow a server field.
+    #[test]
+    fn loop_spec_field_set_unchanged() {
+        let s = LoopSpec {
+            tool: "irc_recv".into(),
+            args: json!({}),
+            interval_secs: 10.0,
+            ignore: "(no new messages)".into(),
+            prefix: "[l] ".into(),
+            poll_timeout_secs: None,
+        };
+        assert_eq!(s.tool, "irc_recv");
+        let _ = LoopHandle {
+            spec: s,
+            stop: Arc::new(AtomicBool::new(false)),
+            polls: Arc::new(AtomicU64::new(0)),
+            injects: Arc::new(AtomicU64::new(0)),
+            filter: Arc::new(Mutex::new(None)),
+            backlog: Arc::new(Mutex::new(super::Backlog { entries: VecDeque::new(), dropped: 0 })),
+            follow: Arc::new(Mutex::new(HashMap::new())),
+            follow_window: Arc::new(AtomicU64::new(60)),
+            debounce: Arc::new(Mutex::new(super::Debounce::default())),
+        };
     }
 }
