@@ -17,6 +17,7 @@
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -32,11 +33,19 @@ struct Sub {
 
 impl Sub {
     fn spawn(argv: &[String]) -> Result<(Arc<Sub>, Child), String> {
-        let mut child = Command::new(&argv[0])
-            .args(&argv[1..])
+        Sub::spawn_env(argv, &HashMap::new())
+    }
+
+    fn spawn_env(argv: &[String], env: &HashMap<String, String>) -> Result<(Arc<Sub>, Child), String> {
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn subordinate {}: {e}", argv[0]))?;
         let stdin = child.stdin.take().ok_or("no subordinate stdin")?;
@@ -334,6 +343,8 @@ impl Debounce {
 struct Cfg {
     session: String,
     tttt_bin: String,
+    dynamic: bool,
+    allowlist: PathBuf,
 }
 
 /// Make untrusted text (chat lines) inert for tttt's send_keys while it
@@ -654,6 +665,301 @@ fn own_tools_json(cfg: &Cfg) -> Vec<Value> {
 
 type Loops = Mutex<HashMap<String, LoopHandle>>;
 
+// ---- dynamic mode: attach/detach allowlisted MCP subordinates at runtime ------
+
+/// One allowlist entry: attach takes a NAME, never a command, so an in-session
+/// prompt (or an inject) can never spawn arbitrary code.
+#[derive(Debug, Clone)]
+struct AllowEntry {
+    name: String,
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+/// Parse the allowlist JSON (array of {name, command, args?, env?}) as a pure
+/// fn: Err carries the reason attach will quote when the registry ends up empty.
+fn parse_allowlist(text: &str) -> Result<Vec<AllowEntry>, String> {
+    let v: Value = serde_json::from_str(text)
+        .map_err(|e| format!("allowlist is not valid JSON: {e}"))?;
+    let arr = v
+        .as_array()
+        .ok_or("allowlist must be a JSON array of {name, command, args, env} entries")?;
+    let mut out = Vec::new();
+    for (i, e) in arr.iter().enumerate() {
+        let name = e["name"]
+            .as_str()
+            .ok_or_else(|| format!("allowlist entry {i}: missing 'name'"))?;
+        let command = e["command"].as_str().ok_or_else(|| {
+            format!("allowlist entry {i} ('{name}'): missing 'command'")
+        })?;
+        let mut args = Vec::new();
+        if !e["args"].is_null() {
+            let a = e["args"]
+                .as_array()
+                .ok_or_else(|| format!("allowlist entry {i} ('{name}'): 'args' must be an array"))?;
+            for arg in a {
+                let s = arg.as_str().ok_or_else(|| {
+                    format!("allowlist entry {i} ('{name}'): 'args' must be strings")
+                })?;
+                args.push(s.to_string());
+            }
+        }
+        let mut env = HashMap::new();
+        if !e["env"].is_null() {
+            let o = e["env"]
+                .as_object()
+                .ok_or_else(|| format!("allowlist entry {i} ('{name}'): 'env' must be an object"))?;
+            for (k, val) in o {
+                let s = val.as_str().ok_or_else(|| {
+                    format!("allowlist entry {i} ('{name}'): env value for '{k}' must be a string")
+                })?;
+                env.insert(k.clone(), s.to_string());
+            }
+        }
+        out.push(AllowEntry { name: name.to_string(), command: command.to_string(), args, env });
+    }
+    Ok(out)
+}
+
+/// Spawn argv for an entry: command first, then its args. The tool call can
+/// only ever contribute a NAME; argv never comes from the call.
+fn build_argv(e: &AllowEntry) -> Vec<String> {
+    let mut argv = Vec::with_capacity(1 + e.args.len());
+    argv.push(e.command.clone());
+    argv.extend(e.args.iter().cloned());
+    argv
+}
+
+fn default_allowlist_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("mcp-absorb").join("allowlist.json")
+}
+
+/// Missing/unreadable/bad allowlist = empty registry + a reason attach quotes
+/// (dynamic mode must start fine: CC holds us across its 30 s connect gate).
+fn load_allowlist(path: &Path) -> (Vec<AllowEntry>, Option<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match parse_allowlist(&text) {
+            Ok(entries) => (entries, None),
+            Err(e) => (Vec::new(), Some(format!("cannot parse allowlist {}: {e}", path.display()))),
+        },
+        Err(e) => (
+            Vec::new(),
+            Some(format!("cannot read allowlist {}: {e}", path.display())),
+        ),
+    }
+}
+
+struct DynEntry {
+    sub: Arc<Sub>,
+    child: Child,
+    tools: Vec<Value>,
+    attached_at: u64,
+    healthy: bool,
+}
+
+struct Dyn {
+    map: Mutex<HashMap<String, DynEntry>>,
+    allowlist: Vec<AllowEntry>,
+    allowlist_error: Option<String>,
+}
+
+const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn dyn_attach(dynst: &Dyn, a: &Value) -> Result<String, String> {
+    let name = a["name"].as_str().ok_or("missing 'name'")?;
+    let def = dynst.allowlist.iter().find(|e| e.name == name).ok_or_else(|| {
+        if dynst.allowlist.is_empty() {
+            match &dynst.allowlist_error {
+                Some(r) => format!("cannot attach '{name}': {r}"),
+                None => format!("cannot attach '{name}': the allowlist is empty"),
+            }
+        } else {
+            let mut names: Vec<&str> = dynst.allowlist.iter().map(|e| e.name.as_str()).collect();
+            names.sort();
+            format!("'{name}' is not in the allowlist; available: {}", names.join(", "))
+        }
+    })?;
+    let mut map = dynst.map.lock().unwrap();
+    if map.contains_key(name) {
+        return Err(format!("'{name}' is already attached; detach it first"));
+    }
+    let (sub, mut child) = Sub::spawn_env(&build_argv(def), &def.env)?;
+    let handshake = sub.call(
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-absorb", "version": env!("CARGO_PKG_VERSION")}
+        }),
+        ATTACH_HANDSHAKE_TIMEOUT,
+    );
+    let tools = match handshake
+        .map(|_| sub.notify("notifications/initialized", json!({})))
+        .and_then(|()| sub.call("tools/list", json!({}), ATTACH_HANDSHAKE_TIMEOUT))
+    {
+        Ok(r) => r["result"]["tools"].as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("attach '{name}' handshake failed: {e}"));
+        }
+    };
+    let tool_names: Vec<String> = tools
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+        .collect();
+    map.insert(
+        name.to_string(),
+        DynEntry { sub, child, tools, attached_at: now_secs(), healthy: true },
+    );
+    Ok(format!(
+        "attached '{name}': {} tool(s): {}",
+        tool_names.len(),
+        tool_names.join(", ")
+    ))
+}
+
+fn dyn_detach(dynst: &Dyn, a: &Value) -> Result<String, String> {
+    let name = a["name"].as_str().ok_or("missing 'name'")?;
+    match dynst.map.lock().unwrap().remove(name) {
+        Some(mut e) => {
+            let _ = e.child.kill();
+            let _ = e.child.wait();
+            Ok(format!("detached '{name}'"))
+        }
+        None => Err(format!("'{name}' is not attached")),
+    }
+}
+
+fn dyn_list(dynst: &Dyn) -> Result<String, String> {
+    let map = dynst.map.lock().unwrap();
+    if map.is_empty() {
+        return Ok("(no servers attached)".into());
+    }
+    let mut lines: Vec<String> = map
+        .iter()
+        .map(|(name, e)| {
+            format!(
+                "{name}: {}, {} tool(s), attached {}",
+                if e.healthy { "ready" } else { "unhealthy" },
+                e.tools.len(),
+                age_str(e.attached_at)
+            )
+        })
+        .collect();
+    lines.sort();
+    Ok(lines.join("\n"))
+}
+
+fn dyn_tools(dynst: &Dyn, a: &Value) -> Result<String, String> {
+    let name = a["name"].as_str().ok_or("missing 'name'")?;
+    let map = dynst.map.lock().unwrap();
+    let e = map.get(name).ok_or_else(|| format!("'{name}' is not attached"))?;
+    if e.tools.is_empty() {
+        return Ok("(no tools)".into());
+    }
+    let mut out = String::new();
+    for t in &e.tools {
+        out.push_str(&format!(
+            "- {}: {}\n",
+            t["name"].as_str().unwrap_or("?"),
+            t["description"].as_str().unwrap_or("")
+        ));
+        if t.get("inputSchema").is_some() {
+            out.push_str(&format!("  inputSchema: {}\n", t["inputSchema"]));
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+fn dyn_call(dynst: &Dyn, a: &Value) -> Result<String, String> {
+    let name = a["name"].as_str().ok_or("missing 'name'")?;
+    let tool = a["tool"].as_str().ok_or("missing 'tool'")?;
+    let args = if a["args"].is_object() { a["args"].clone() } else { json!({}) };
+    let timeout = Duration::from_secs(a["timeout_s"].as_f64().unwrap_or(60.0).clamp(1.0, 300.0) as u64);
+    let mut map = dynst.map.lock().unwrap();
+    let e = map
+        .get_mut(name)
+        .ok_or_else(|| format!("'{name}' is not attached; attach it first"))?;
+    match e.sub.call("tools/call", json!({"name": tool, "arguments": args}), timeout) {
+        Ok(r) => {
+            let (text, is_err) = result_text(&r);
+            if is_err {
+                Err(text)
+            } else {
+                Ok(text)
+            }
+        }
+        Err(err) => {
+            // Transport death (timeout or write error): v1 does not restart;
+            // recover = detach + attach. The pending id is already dropped.
+            e.healthy = false;
+            Err(err)
+        }
+    }
+}
+
+fn dyn_tools_json() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "attach",
+            "description": "Attach an allowlisted MCP server by NAME (spawns its allowlist command+args+env, runs the initialize handshake + tools/list, caches the tool list). Errors: not in allowlist, already attached (detach first), spawn or handshake failure.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Allowlist entry name"}
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "detach",
+            "description": "Detach an attached MCP server by name: kills its child process and removes the entry. Error if not attached.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Attached server name"}
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "list",
+            "description": "One line per attached server: name, state (ready/unhealthy), tool count, attached-ago. Unhealthy = last call hit a timeout or write error; recover with detach + attach (no auto-restart).",
+            "inputSchema": {"type": "object", "properties": {}}
+        }),
+        json!({
+            "name": "tools",
+            "description": "An attached server's cached tools/list as text (name, description, JSON schema). This is how you discover the schemas to pass to call().",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Attached server name"}
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "call",
+            "description": "Call one tool on an attached server (tools/call passthrough, flattened text result). On timeout the entry is marked unhealthy.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Attached server name"},
+                    "tool": {"type": "string", "description": "Tool name as reported by tools(name)"},
+                    "args": {"type": "object", "description": "Tool arguments"},
+                    "timeout_s": {"type": "number", "description": "Call timeout in seconds (default 60, clamped 1-300)"}
+                },
+                "required": ["name", "tool"]
+            }
+        }),
+    ]
+}
+
 fn tool_create_loop(loops: &Loops, sub: &Arc<Sub>, cfg: &Arc<Cfg>, a: &Value) -> Result<String, String> {
     let name = a["name"].as_str().ok_or("missing 'name'")?.to_string();
     let tool = a["tool"].as_str().ok_or("missing 'tool'")?.to_string();
@@ -839,12 +1145,16 @@ fn tool_fetch_backlog(loops: &Loops, a: &Value) -> Result<String, String> {
 fn parse_args() -> Result<(Cfg, Vec<String>), String> {
     let mut session = "pty-1".to_string();
     let mut tttt_bin = "tttt".to_string();
+    let mut dynamic = false;
+    let mut allowlist = default_allowlist_path();
     let mut it = std::env::args().skip(1);
     let mut sub_argv = Vec::new();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--session" => session = it.next().ok_or("missing value after --session")?,
             "--tttt-bin" => tttt_bin = it.next().ok_or("missing value after --tttt-bin")?,
+            "--dynamic" => dynamic = true,
+            "--allowlist" => allowlist = PathBuf::from(it.next().ok_or("missing value after --allowlist")?),
             "--" => {
                 sub_argv = it.collect();
                 break;
@@ -852,10 +1162,14 @@ fn parse_args() -> Result<(Cfg, Vec<String>), String> {
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    if sub_argv.is_empty() {
+    if dynamic {
+        if !sub_argv.is_empty() {
+            return Err("usage: --dynamic takes no subordinate argv; remove the '-- ...' and attach servers at runtime with the attach tool (allowlist: --allowlist PATH, default ~/.config/mcp-absorb/allowlist.json)".into());
+        }
+    } else if sub_argv.is_empty() {
         return Err("usage: mcp-absorb [--session pty-1] [--tttt-bin tttt] -- <subordinate-cmd> [args...]".into());
     }
-    Ok((Cfg { session, tttt_bin }, sub_argv))
+    Ok((Cfg { session, tttt_bin, dynamic, allowlist }, sub_argv))
 }
 
 fn main() {
@@ -867,11 +1181,23 @@ fn main() {
         }
     };
     let cfg = Arc::new(cfg);
-    let (sub, mut child) = match Sub::spawn(&sub_argv) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("mcp-absorb: {e}");
-            std::process::exit(1);
+    // Dynamic mode: no config-fixed subordinate; servers attach/detach at
+    // runtime from the allowlist. Static mode stays byte-identical.
+    let dynst: Option<Dyn> = if cfg.dynamic {
+        let (allowlist, allowlist_error) = load_allowlist(&cfg.allowlist);
+        Some(Dyn { map: Mutex::new(HashMap::new()), allowlist, allowlist_error })
+    } else {
+        None
+    };
+    let (sub, mut child): (Option<Arc<Sub>>, Option<Child>) = if cfg.dynamic {
+        (None, None)
+    } else {
+        match Sub::spawn(&sub_argv) {
+            Ok(v) => (Some(v.0), Some(v.1)),
+            Err(e) => {
+                eprintln!("mcp-absorb: {e}");
+                std::process::exit(1);
+            }
         }
     };
     let loops: Loops = Mutex::new(HashMap::new());
@@ -900,8 +1226,11 @@ fn main() {
             "initialize" => {
                 // Handshake the subordinate with the client's own params, but
                 // answer for ourselves (capabilities stay plain tools).
-                let _ = sub.call("initialize", params.clone(), Duration::from_secs(20));
-                sub.notify("notifications/initialized", json!({}));
+                // Dynamic mode has no fixed subordinate to hand the params to.
+                if let Some(s) = sub.as_ref() {
+                    let _ = s.call("initialize", params.clone(), Duration::from_secs(20));
+                    s.notify("notifications/initialized", json!({}));
+                }
                 let ver = params["protocolVersion"].as_str().unwrap_or("2024-11-05");
                 Some(reply(json!({
                     "protocolVersion": ver,
@@ -911,45 +1240,75 @@ fn main() {
             }
             "ping" => Some(reply(json!({}))),
             "tools/list" => {
-                let mut tools: Vec<Value> = sub
-                    .call("tools/list", json!({}), Duration::from_secs(20))
-                    .ok()
-                    .and_then(|r| r["result"]["tools"].as_array().cloned())
-                    .unwrap_or_default();
-                tools.extend(own_tools_json(&cfg));
+                // Dynamic mode exposes ONLY the five dynamic tools (the
+                // inject-loop tools poll one fixed subordinate: meaningless
+                // without one, removed per SPEC-dynamic v1).
+                let tools: Vec<Value> = if cfg.dynamic {
+                    dyn_tools_json()
+                } else {
+                    let mut tools: Vec<Value> = sub
+                        .as_ref()
+                        .unwrap()
+                        .call("tools/list", json!({}), Duration::from_secs(20))
+                        .ok()
+                        .and_then(|r| r["result"]["tools"].as_array().cloned())
+                        .unwrap_or_default();
+                    tools.extend(own_tools_json(&cfg));
+                    tools
+                };
                 Some(reply(json!({"tools": tools})))
             }
             "tools/call" => {
                 let name = params["name"].as_str().unwrap_or("");
                 let args = params["arguments"].clone();
-                let own = match name {
-                    "create_tttt_inject_loop" => Some(tool_create_loop(&loops, &sub, &cfg, &args)),
-                    "delete_tttt_inject_loop" => Some(tool_delete_loop(&loops, &args)),
-                    "list_tttt_inject_loops" => Some(tool_list_loops(&loops)),
-                    "set_inject_filter" => Some(tool_set_filter(&loops, &args)),
-                    "fetch_inject_backlog" => Some(tool_fetch_backlog(&loops, &args)),
-                    _ => None,
-                };
-                match own {
-                    Some(out) => {
-                        let (text, is_err) = match out {
-                            Ok(t) => (t, false),
-                            Err(e) => (e, true),
-                        };
-                        Some(reply(json!({
-                            "content": [{"type": "text", "text": text}],
-                            "isError": is_err
-                        })))
-                    }
-                    None => {
-                        // Proxy to the subordinate. Generous timeout: the agent
-                        // may deliberately long-poll (e.g. irc_recv wait 600).
-                        match sub.call("tools/call", params.clone(), Duration::from_secs(660)) {
-                            Ok(r) => Some(reply(r["result"].clone())),
-                            Err(e) => Some(reply(json!({
-                                "content": [{"type": "text", "text": e}],
-                                "isError": true
-                            }))),
+                if cfg.dynamic {
+                    let dynst = dynst.as_ref().unwrap();
+                    let out = match name {
+                        "attach" => dyn_attach(dynst, &args),
+                        "detach" => dyn_detach(dynst, &args),
+                        "list" => dyn_list(dynst),
+                        "tools" => dyn_tools(dynst, &args),
+                        "call" => dyn_call(dynst, &args),
+                        other => Err(format!("unknown tool: {other}")),
+                    };
+                    let (text, is_err) = match out {
+                        Ok(t) => (t, false),
+                        Err(e) => (e, true),
+                    };
+                    Some(reply(json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": is_err
+                    })))
+                } else {
+                    let own = match name {
+                        "create_tttt_inject_loop" => Some(tool_create_loop(&loops, sub.as_ref().unwrap(), &cfg, &args)),
+                        "delete_tttt_inject_loop" => Some(tool_delete_loop(&loops, &args)),
+                        "list_tttt_inject_loops" => Some(tool_list_loops(&loops)),
+                        "set_inject_filter" => Some(tool_set_filter(&loops, &args)),
+                        "fetch_inject_backlog" => Some(tool_fetch_backlog(&loops, &args)),
+                        _ => None,
+                    };
+                    match own {
+                        Some(out) => {
+                            let (text, is_err) = match out {
+                                Ok(t) => (t, false),
+                                Err(e) => (e, true),
+                            };
+                            Some(reply(json!({
+                                "content": [{"type": "text", "text": text}],
+                                "isError": is_err
+                            })))
+                        }
+                        None => {
+                            // Proxy to the subordinate. Generous timeout: the agent
+                            // may deliberately long-poll (e.g. irc_recv wait 600).
+                            match sub.as_ref().unwrap().call("tools/call", params.clone(), Duration::from_secs(660)) {
+                                Ok(r) => Some(reply(r["result"].clone())),
+                                Err(e) => Some(reply(json!({
+                                    "content": [{"type": "text", "text": e}],
+                                    "isError": true
+                                }))),
+                            }
                         }
                     }
                 }
@@ -969,7 +1328,16 @@ fn main() {
             let _ = out.flush();
         }
     }
-    let _ = child.kill();
+    if let Some(c) = child.as_mut() {
+        let _ = c.kill();
+    }
+    if let Some(d) = &dynst {
+        // Dynamic mode: attached children die with us (v1: no daemonizing).
+        for (_, mut e) in d.map.lock().unwrap().drain() {
+            let _ = e.child.kill();
+            let _ = e.child.wait();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1306,5 +1674,56 @@ mod neutralize_tests {
         assert_eq!(n("an @ alone"), "an @ alone");
         assert_eq!(n("ends with @"), "ends with @");
         assert_eq!(n("@@weird"), "@@weird");
+    }
+}
+
+#[cfg(test)]
+mod dyn_tests {
+    use super::{build_argv, parse_allowlist, AllowEntry};
+    use std::collections::HashMap;
+
+    #[test]
+    fn allowlist_parses_full_and_minimal_entries() {
+        let text = r#"[
+            {"name": "tttt", "command": "/Users/me/bin/tttt", "args": ["mcp"], "env": {"TTTT_MCP_SOCKET": "/tmp/tttt-mini.sock"}},
+            {"name": "mqtt", "command": "/usr/local/bin/mosquitto-mcp"}
+        ]"#;
+        let v = parse_allowlist(text).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].name, "tttt");
+        assert_eq!(v[0].command, "/Users/me/bin/tttt");
+        assert_eq!(v[0].args, vec!["mcp".to_string()]);
+        assert_eq!(v[0].env.get("TTTT_MCP_SOCKET").map(String::as_str), Some("/tmp/tttt-mini.sock"));
+        assert!(v[1].args.is_empty());
+        assert!(v[1].env.is_empty());
+    }
+
+    #[test]
+    fn allowlist_empty_array_is_a_valid_empty_registry() {
+        assert!(parse_allowlist("[]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn allowlist_rejects_bad_json_wrong_shape_and_missing_fields() {
+        assert!(parse_allowlist("not json").is_err());
+        assert!(parse_allowlist(r#"{"name": "x", "command": "c"}"#).is_err()); // object, not array
+        assert!(parse_allowlist(r#"[{"command": "c"}]"#).is_err()); // missing name
+        assert!(parse_allowlist(r#"[{"name": "n"}]"#).is_err()); // missing command
+        assert!(parse_allowlist(r#"[{"name": "n", "command": "c", "args": [1]}]"#).is_err()); // non-string arg
+        assert!(parse_allowlist(r#"[{"name": "n", "command": "c", "args": {"a": "b"}}]"#).is_err()); // args not array
+        assert!(parse_allowlist(r#"[{"name": "n", "command": "c", "env": {"A": 2}}]"#).is_err()); // non-string env value
+    }
+
+    #[test]
+    fn argv_build_is_command_then_args_never_the_call() {
+        let e = AllowEntry {
+            name: "x".into(),
+            command: "/bin/x".into(),
+            args: vec!["a".into(), "--flag".into()],
+            env: HashMap::new(),
+        };
+        assert_eq!(build_argv(&e), vec!["/bin/x".to_string(), "a".to_string(), "--flag".to_string()]);
+        let bare = AllowEntry { name: "y".into(), command: "y".into(), args: vec![], env: HashMap::new() };
+        assert_eq!(build_argv(&bare), vec!["y".to_string()]);
     }
 }
