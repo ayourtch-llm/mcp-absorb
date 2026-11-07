@@ -79,6 +79,37 @@ a tiny test server that sends list_changed after a delay, watch whether new tool
 in the session without a restart. If yes, v2 relays child notifications and promotes
 `name__tool` as real tools at attach time. If no, the v1 contract stands permanently.
 
+## v2a: inject loops over dynamically attached servers (his steer 2026-11-07 13:4x: "implement v2 first with the inject loop")
+
+Goal: in `--dynamic` mode the 5 inject-loop tools come back, with the loop's poll target
+being a `(server, tool)` pair instead of the single static subordinate. The tool-promotion
+experiment (old v2, renamed v2b) stays parked.
+
+- Dynamic tool set = the 5 dyn tools + `create/delete/list_tttt_inject_loop` +
+  `set_inject_filter` + `fetch_inject_backlog`. Static mode: byte-identical to today
+  (and `create_tttt_inject_loop` with a `server` param there = clear reject).
+- `create_tttt_inject_loop` (dynamic): extra required param `server` — must be attached
+  at create time; `tool` is a tool ON that server. `args` / `interval_secs` / `ignore` /
+  `prefix` / poll timeout / filter options keep the static semantics (LoopSpec fields,
+  main.rs:127).
+- **Resolution per tick**: the loop resolves `server -> Arc<Sub>` from the Dyn map at
+  every poll. Missing server = skip the tick; the FIRST miss injects one note
+  (`loop <name>: server <server> not attached, suspending`) and the loop keeps polling,
+  auto-resuming on re-attach with no further notes. `detach` does NOT delete loops
+  polling that server; suspended loops show `state=suspended` in `list`.
+- `list_tttt_inject_loop` (dynamic) shows `server` + `tool` per loop;
+  delete / set_inject_filter / fetch_inject_backlog stay loop-keyed and unchanged.
+- Plumbing: `run_loop` takes a `SubRef` (`Static(Arc<Sub>)` | `Dynamic(Arc<Dyn>, String)`)
+  instead of a bare `Arc<Sub>`; the Static variant keeps today's behavior exactly.
+
+Tests:
+- Pure: loop-spec parse (server required in dynamic, rejected in static), resolver
+  transitions ok/missing/suspend/resume.
+- Integration: attach the fixture, create a loop polling the fixture tool with a
+  matching pattern, assert the loop advances and the inject path no-ops safely —
+  `tttt_bin=/bin/true` makes `run_ctl_send` a no-op if it tolerates that; if it does
+  not, cover the resolver + spec plumbing as pure fns and say so in the report.
+
 ## Implementation shape (~150-200 LOC + tests)
 
 - `Cfg` += `dynamic: bool, allowlist: PathBuf` (parse_args, main.rs:839: new flags;
