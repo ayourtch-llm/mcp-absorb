@@ -93,10 +93,15 @@ experiment (old v2, renamed v2b) stays parked.
   `prefix` / poll timeout / filter options keep the static semantics (LoopSpec fields,
   main.rs:127).
 - **Resolution per tick**: the loop resolves `server -> Arc<Sub>` from the Dyn map at
-  every poll. Missing server = skip the tick; the FIRST miss injects one note
-  (`loop <name>: server <server> not attached, suspending`) and the loop keeps polling,
-  auto-resuming on re-attach with no further notes. `detach` does NOT delete loops
-  polling that server; suspended loops show `state=suspended` in `list`.
+  every poll. Server missing from the map (detach, or never attached) = the loop ENDS
+  after injecting ONE final note (`loop <name>: server <server> not attached, ending —
+  recreate to resume`). `detach` ends loops polling that server the same way; re-attach
+  revives NOTHING — recreating a loop is one explicit tool call. Loop lifetime ⊆
+  server-attached lifetime. (ayourtch 13:4x, twice: auto-resume is too surprising — the
+  same allowlist name may point elsewhere after an edit, a resume injects a stale-delta
+  burst, and silent wake-ups break predictability. "Perfect." on the end-on-detach form.)
+  Call-level failures (timeout, write error) keep the STATIC failure semantics
+  (skip/backlog) — they do not end the loop; only a missing map entry does.
 - `list_tttt_inject_loop` (dynamic) shows `server` + `tool` per loop;
   delete / set_inject_filter / fetch_inject_backlog stay loop-keyed and unchanged.
 - Plumbing: `run_loop` takes a `SubRef` (`Static(Arc<Sub>)` | `Dynamic(Arc<Dyn>, String)`)
@@ -104,7 +109,7 @@ experiment (old v2, renamed v2b) stays parked.
 
 Tests:
 - Pure: loop-spec parse (server required in dynamic, rejected in static), resolver
-  transitions ok/missing/suspend/resume.
+  transitions ok / missing-ends (and call-failure does NOT end).
 - Integration: attach the fixture, create a loop polling the fixture tool with a
   matching pattern, assert the loop advances and the inject path no-ops safely —
   `tttt_bin=/bin/true` makes `run_ctl_send` a no-op if it tolerates that; if it does
